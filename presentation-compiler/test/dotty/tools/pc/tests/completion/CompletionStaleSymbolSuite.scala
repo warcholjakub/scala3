@@ -1,8 +1,5 @@
 package dotty.tools.pc.tests.completion
 
-import scala.jdk.CollectionConverters.*
-import scala.language.unsafeNulls
-
 import dotty.tools.pc.base.BaseCompletionSuite
 
 import org.junit.Test
