@@ -19,7 +19,7 @@ import dotty.tools.io.AbstractFile
 
 import ast.{Trees, tpd}
 import core.*, core.Decorators.*
-import Contexts.*, Names.*, NameOps.*, Symbols.*, SymDenotations.*, Trees.*, Types.*
+import Contexts.*, Names.*, NameOps.*, Scopes.*, Symbols.*, SymDenotations.*, Trees.*, Types.*
 import Denotations.staticRef
 import classpath.*
 import reporting.*
@@ -160,6 +160,7 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
 
       given Context = myCtx
 
+      val previousTrees = myOpenedTrees.getOrElse(uri, Nil)
       myOpenedFiles(uri) = source
 
       run.compileSources(List(source))
@@ -168,7 +169,9 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
       val unit = if ctxRun.units.nonEmpty then ctxRun.units.head else ctxRun.suspendedUnits.head
       val t = unit.tpdTree
       cleanup(t)
-      myOpenedTrees(uri) = topLevelTrees(t, source)
+      val newTrees = topLevelTrees(t, source)
+      unlinkStaleTopLevelSyms(previousTrees, newTrees)
+      myOpenedTrees(uri) = newTrees
       myCompilationUnits(uri) = unit
       myCtx = myCtx.fresh.setPhase(myInitCtx.base.typerPhase)
 
@@ -249,6 +252,20 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
     catch {
       case _: NoSuchFileException =>
     }
+
+  /** Unlink top-level symbols from the previous compilation that no longer exist
+   *  in the new compilation. This prevents stale symbols from appearing in completions.
+   */
+  private def unlinkStaleTopLevelSyms(previousTrees: List[SourceTree], newTrees: List[SourceTree])(using Context): Unit =
+    val newSymbols = newTrees.collect { case SourceTree(td: TypeDef, _) => td.symbol }.toSet
+    previousTrees.foreach:
+      case SourceTree(td: TypeDef, _) =>
+        val sym = td.symbol
+        if sym.exists && !newSymbols.contains(sym) && sym.owner.is(Flags.Package) then
+          sym.owner.info.decls match
+            case ms: MutableScope => ms.unlink(sym)
+            case _ =>
+      case _ =>
 
   private def topLevelTrees(topTree: Tree, source: SourceFile): List[SourceTree] = {
     val trees = new mutable.ListBuffer[SourceTree]
