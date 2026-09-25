@@ -1,0 +1,182 @@
+###################################################################################################
+###              THIS IS A WORKFLOW TO PUBLISH THE APT AND YUM REPOSITORIES                     ###
+### HOW TO USE:                                                                                 ###
+###   - THE OFFICIAL RELEASE WORKFLOW SHOULD CALL THIS WORKFLOW                                 ###
+###   - IT CAN ALSO BE RUN MANUALLY FROM THE ACTIONS TAB, TO REPUBLISH A GIVEN VERSION          ###
+###   - IT UPLOADS THE .deb AND .rpm OF `version` TO THE HOST SERVING repo.scala-lang.org       ###
+###                                                                                             ###
+### NOTE:                                                                                       ###
+###   - THE PACKAGES ARE READ BACK FROM THE GITHUB RELEASE OF `version`, STILL A DRAFT          ###
+###   - EVERY PUBLISHED VERSION IS KEPT, WITHOUT EVER DOWNLOADING AN OLDER PACKAGE. BOTH INDEX  ###
+###     FORMATS ARE REBUILT FROM THE PUBLISHED INDEX PLUS THE NEW PACKAGE ALONE:                ###
+###       * YUM: mergerepo_c MERGES THE OLD repodata/ WITH THE NEW ONE-PACKAGE INDEX            ###
+###       * APT: Packages IS A CONCATENATION OF STANZAS, SO THE NEW STANZA IS APPENDED          ###
+###     THIS MATTERS BECAUSE EACH PACKAGE IS ~100 MiB AND createrepo_c/dpkg-scanpackages ONLY   ###
+###     INDEX FILES THEY CAN SEE ON DISK                                                        ###
+###   - BOTH KEY.gpg AND THE scala3.repo/scala3.list SNIPPETS ARE STATIC AND UPLOADED ONCE BY   ###
+###     HAND. THEY ONLY CHANGE WITH THE HOSTING URL OR THE SIGNING KEY. IF YOU ROTATE THE KEY,  ###
+###     RE-UPLOAD KEY.gpg                                                                       ###
+###   - WHERE IT PUBLISHES IS CONFIGURED BY THE PACKAGES_* REPOSITORY VARIABLES, SO A FORK      ###
+###     PUBLISHES TO ITS OWN DIRECTORY WITH NO CHANGE TO THIS FILE                              ###
+###################################################################################################
+
+name: Publish the APT and YUM repositories
+run-name: Publish Scala ${{ inputs.version }} to the APT and YUM repositories
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The Scala version to publish, i.e. the release tag'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      version:
+        description: 'The Scala version to publish, i.e. the release tag'
+        required: true
+        type: string
+
+permissions:
+  # The release is still a draft when this runs, and drafts are not reachable
+  # with read-only access, so the packages can only be downloaded with write.
+  # Same reason the `provenance` job in ci.yaml asks for it.
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      VERSION     : ${{ inputs.version }}
+      DEB         : scala3-${{ inputs.version }}-x86_64-pc-linux.deb
+      RPM         : scala3-${{ inputs.version }}-x86_64-pc-linux.rpm
+      BASE_URL    : ${{ vars.PACKAGES_BASE_URL }}
+      FINGERPRINT : ${{ vars.SCALA_PGP_FINGERPRINT }}
+      REMOTE      : ${{ vars.PACKAGES_USER }}@${{ vars.PACKAGES_HOST }}
+      REMOTE_DIR  : ${{ vars.PACKAGES_PATH }}
+      RSH         : ssh -p ${{ vars.PACKAGES_PORT }} -o IdentitiesOnly=yes
+    steps:
+      - name: Download the packages from the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO : ${{ github.repository }}
+        run: gh release download "$VERSION" --pattern "$DEB" --pattern "$RPM"
+
+      - name: Ensure the repository tooling
+        # rpm -> rpmsign, createrepo-c -> createrepo_c and mergerepo_c,
+        # dpkg-dev -> dpkg-scanpackages, apt-utils -> apt-ftparchive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm createrepo-c dpkg-dev apt-utils
+
+      - name: Import the signing key
+        # Also presets the passphrase in the agent, so rpmsign and gpg run unattended
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.SCALA_PGP_KEY }}
+          passphrase     : ${{ secrets.SCALA_PGP_PASSPHRASE }}
+          fingerprint    : ${{ env.FINGERPRINT }}
+
+      - name: Set up SSH
+        env:
+          SSH_KEY    : ${{ secrets.SYNCPKGS_KEY }}
+          KNOWN_HOSTS: ${{ vars.PACKAGES_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY"     > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+
+      - name: Build the YUM repository
+        env:
+          # rpmsign warns "Could not set GPG_TTY" when there is no terminal.
+          # Setting it to anything skips that probe; signing is unaffected.
+          GPG_TTY: /dev/null
+        run: |
+          mkdir -p yum-new
+
+          # Canonical name inside the repository, read off the package itself
+          nvra=$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "$RPM")
+          cp "$RPM" "yum-new/$nvra.rpm"
+
+          # `__gpg` has to be pointed at gpg by hand: rpm defaults to gpg2, which
+          # does not exist on Ubuntu, and rpmsign then fails with "Could not exec gpg"
+          rpmsign --define "__gpg /usr/bin/gpg" --define "_gpg_name $FINGERPRINT" --addsign "yum-new/$nvra.rpm"
+
+          # Must run after signing: the index records checksums of the signed bytes
+          createrepo_c --quiet yum-new
+
+          # Only repodata/ is fetched, never the packages. A reply that is neither
+          # 200 nor 404 is not evidence that the repository is empty, and carrying
+          # on would publish an index listing only this version.
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/rpm/repodata/repomd.xml" || echo 000)
+          case "$code" in
+            200)
+              mkdir -p yum-old
+              rsync -rt -e "$RSH" "$REMOTE:$REMOTE_DIR/rpm/repodata/" yum-old/repodata/
+              mergerepo_c --all --repo=yum-old --repo=yum-new -o yum-merged
+              echo "YUM_INDEX=yum-merged/repodata" >> "$GITHUB_ENV"
+              echo "YUM: merged with the published index"
+              ;;
+            404)
+              echo "YUM_INDEX=yum-new/repodata" >> "$GITHUB_ENV"
+              echo "YUM: nothing published yet, this is the first publish"
+              ;;
+            *)
+              echo "YUM: cannot tell whether anything is published: HTTP $code" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Build the APT repository
+        run: |
+          mkdir -p apt
+          cp "$DEB" apt/
+
+          # Packages is a plain concatenation of stanzas, so the published one is
+          # fetched as text and the new stanza appended. Same reasoning as the YUM
+          # side: an unexpected reply must not be read as "the repository is empty".
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/debian/Packages" || echo 000)
+          case "$code" in
+            200)
+              curl -fsS -o published.Packages "$BASE_URL/debian/Packages"
+              echo "APT: appending to the published index"
+              ;;
+            404)
+              : > published.Packages
+              echo "APT: nothing published yet, this is the first publish"
+              ;;
+            *)
+              echo "APT: cannot tell whether anything is published: HTTP $code" >&2
+              exit 1
+              ;;
+          esac
+
+          # dpkg-scanpackages only looks at .deb files, so it emits the stanza for
+          # the new package alone, with a Filename relative to this flat directory
+          ( cd apt && dpkg-scanpackages --multiversion . ) > new.Packages
+          cat published.Packages new.Packages > apt/Packages
+
+          cd apt
+          gzip -k -f Packages
+          apt-ftparchive release . > Release
+          gpg --batch --yes --local-user "$FINGERPRINT" -abs        -o Release.gpg Release
+          gpg --batch --yes --local-user "$FINGERPRINT" --clearsign -o InRelease  Release
+
+      - name: Upload
+        # Packages first, indexes second, so the repositories are never inconsistent
+        # for someone installing while we publish: nothing references a package that
+        # is not there yet. --chmod is explicit so a stray umask on the runner cannot
+        # produce files the web server is unable to read.
+        run: |
+          opts="-rt --chmod=D755,F644 --mkpath"
+
+          rsync $opts -e "$RSH" yum-new/*.rpm "$REMOTE:$REMOTE_DIR/rpm/"
+          rsync $opts -e "$RSH" apt/*.deb     "$REMOTE:$REMOTE_DIR/debian/"
+
+          rsync $opts -e "$RSH" --delete "$YUM_INDEX/" "$REMOTE:$REMOTE_DIR/rpm/repodata/"
+          rsync $opts -e "$RSH" \
+            apt/Packages apt/Packages.gz apt/Release apt/Release.gpg apt/InRelease \
+            "$REMOTE:$REMOTE_DIR/debian/"
+
+          echo "Published scala3 $VERSION to $BASE_URL"
