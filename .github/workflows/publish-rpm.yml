@@ -3,13 +3,19 @@
 ### HOW TO USE:                                                                                 ###
 ###   - THE OFFICIAL RELEASE WORKFLOW SHOULD CALL THIS WORKFLOW                                 ###
 ###   - IT CAN ALSO BE RUN MANUALLY FROM THE ACTIONS TAB, TO REPUBLISH A GIVEN VERSION          ###
-###   - IT PUSHES THE .rpm OF `version` INTO THE PACKAGE REPOSITORY SERVED OVER HTTP            ###
+###   - IT UPLOADS THE .rpm OF `version` TO THE HOST SERVING repo.scala-lang.org                ###
 ###                                                                                             ###
 ### NOTE:                                                                                       ###
-###   - THE .rpm IS READ BACK FROM THE GITHUB RELEASE OF `version`, SO build-rpm.yml MUST HAVE  ###
-###     ATTACHED IT THERE                                                                       ###
-###   - WHERE IT IS PUBLISHED IS CONFIGURED BY THE PACKAGES_REPO AND PACKAGES_BASE_URL          ###
-###     REPOSITORY VARIABLES, SO A FORK PUBLISHES TO ITS OWN SANDBOX WITH NO CHANGE TO THIS FILE##
+###   - THE .rpm IS READ BACK FROM THE GITHUB RELEASE OF `version`, WHICH IS STILL A DRAFT      ###
+###   - EVERY PUBLISHED VERSION IS KEPT. THE TARGET ACCOUNT HAS A RESTRICTED SHELL              ###
+###     (SFTP/SCP/RSYNC ONLY) SO THE INDEX CANNOT BE REBUILT SERVER-SIDE, AND createrepo_c ONLY ###
+###     INDEXES PACKAGES IT CAN SEE ON DISK. INSTEAD THE PUBLISHED INDEX IS FETCHED (METADATA   ###
+###     ONLY, NO PACKAGES) AND MERGED WITH THE NEW ONE, SO NO OLDER PACKAGE IS EVER DOWNLOADED. ###
+###   - WHERE IT PUBLISHES IS CONFIGURED BY THE PACKAGES_* REPOSITORY VARIABLES, SO A FORK      ###
+###     PUBLISHES TO ITS OWN DIRECTORY WITH NO CHANGE TO THIS FILE                              ###
+###   - scala3.repo AND KEY.gpg ARE NOT TOUCHED HERE. THEY ARE STATIC AND UPLOADED ONCE BY HAND:###
+###     THEY ONLY CHANGE WHEN THE HOSTING URL OR THE SIGNING KEY CHANGES, BOTH OF WHICH ARE     ###
+###     DELIBERATE ONE-OFF EVENTS. IF YOU ROTATE THE KEY, RE-UPLOAD KEY.gpg.                    ###
 ###################################################################################################
 
 name: Publish the YUM repository
@@ -30,17 +36,22 @@ on:
         type: string
 
 permissions:
+  # The release is still a draft when this runs, and drafts are not reachable
+  # with read-only access, so the .rpm can only be downloaded with write.
+  # Same reason the `provenance` job in ci.yaml asks for it.
   contents: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     env:
-      PACKAGES_REPO: ${{ vars.PACKAGES_REPO }}
-      BASE_URL     : ${{ vars.PACKAGES_BASE_URL }}
-      FINGERPRINT  : ${{ vars.SCALA_PGP_FINGERPRINT }}
-      VERSION      : ${{ inputs.version }}
-      RPM          : scala3-${{ inputs.version }}-x86_64-pc-linux.rpm
+      VERSION     : ${{ inputs.version }}
+      RPM         : scala3-${{ inputs.version }}-x86_64-pc-linux.rpm
+      BASE_URL    : ${{ vars.PACKAGES_BASE_URL }}
+      FINGERPRINT : ${{ vars.SCALA_PGP_FINGERPRINT }}
+      REMOTE      : ${{ vars.PACKAGES_USER }}@${{ vars.PACKAGES_HOST }}
+      REMOTE_DIR  : ${{ vars.PACKAGES_PATH }}
+      RSH         : ssh -p ${{ vars.PACKAGES_PORT }} -o IdentitiesOnly=yes
     steps:
       - name: Download the .rpm from the GitHub release
         env:
@@ -48,15 +59,8 @@ jobs:
           GH_REPO : ${{ github.repository }}
         run: gh release download "$VERSION" --pattern "$RPM"
 
-      - name: Check out the package repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ env.PACKAGES_REPO }}
-          token     : ${{ secrets.PACKAGES_TOKEN }}
-          path      : packages
-
       - name: Ensure the repository tooling
-        # `rpm` provides rpmsign, `createrepo-c` generates the repodata/ index
+        # `rpm` provides rpmsign; `createrepo-c` provides both createrepo_c and mergerepo_c
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm createrepo-c
 
       - name: Import the signing key
@@ -67,37 +71,59 @@ jobs:
           passphrase     : ${{ secrets.SCALA_PGP_PASSPHRASE }}
           fingerprint    : ${{ env.FINGERPRINT }}
 
-      - name: Update the YUM repository
+      - name: Set up SSH
+        env:
+          SSH_KEY    : ${{ secrets.SYNCPKGS_KEY }}
+          KNOWN_HOSTS: ${{ vars.PACKAGES_KNOWN_HOSTS }}
         run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY"     > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+
+      - name: Sign the package and build its index
+        run: |
+          mkdir -p new
+
           # Canonical name inside the repository, read off the package itself
           nvra=$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "$RPM")
-          mkdir -p packages/rpm
-          cp "$RPM" "packages/rpm/$nvra.rpm"
+          cp "$RPM" "new/$nvra.rpm"
 
-          # The user-facing repository configuration, regenerated from BASE_URL
-          cat > packages/rpm/scala3.repo <<EOF
-          [scala3]
-          name=Scala 3
-          baseurl=$BASE_URL/rpm
-          enabled=1
-          gpgcheck=1
-          gpgkey=$BASE_URL/KEY.gpg
-          EOF
-
-          cd packages/rpm
           # `__gpg` has to be pointed at gpg by hand: rpm defaults to gpg2, which
           # does not exist on Ubuntu, and rpmsign then fails with "Could not exec gpg"
-          rpmsign --define "__gpg /usr/bin/gpg" --define "_gpg_name $FINGERPRINT" --addsign "$nvra.rpm"
-          createrepo_c .
+          rpmsign --define "__gpg /usr/bin/gpg" --define "_gpg_name $FINGERPRINT" --addsign "new/$nvra.rpm"
 
-      - name: Publish the public half of the signing key
-        run: gpg --armor --export "$FINGERPRINT" > packages/KEY.gpg
+          # Must run after signing: the index records checksums of the signed bytes
+          createrepo_c --quiet new
 
-      - name: Push
-        working-directory: packages
+      - name: Merge with the already published index
+        # Only repodata/ is fetched, never the packages themselves. mergerepo_c
+        # reads the old index as data, so previously published versions stay
+        # listed without their .rpm files ever touching this runner.
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Publish scala3 $VERSION"
-          git push
+          mkdir -p old
+          rsync -rt -e "$RSH" "$REMOTE:$REMOTE_DIR/rpm/repodata/" old/repodata/ || true
+
+          if [ -n "$(ls -A old/repodata 2>/dev/null)" ]; then
+            mergerepo_c --all --repo=old --repo=new -o merged
+            echo "INDEX=merged/repodata" >> "$GITHUB_ENV"
+            echo "Merged with the published index"
+          else
+            echo "INDEX=new/repodata" >> "$GITHUB_ENV"
+            echo "No published index yet, this is the first publish"
+          fi
+
+      - name: Upload
+        # Order matters, so the repository is never inconsistent for someone
+        # running `dnf install` while we publish:
+        #   1. the package, additively - nothing references it yet
+        #   2. the index, which now points at a package that is already there
+        # --chmod is explicit so a stray umask on the runner cannot produce files
+        # the web server is unable to read.
+        run: |
+          opts="-rt --chmod=D755,F644 --mkpath"
+
+          rsync $opts -e "$RSH" new/*.rpm          "$REMOTE:$REMOTE_DIR/rpm/"
+          rsync $opts -e "$RSH" --delete "$INDEX/" "$REMOTE:$REMOTE_DIR/rpm/repodata/"
+
+          echo "Published scala3 $VERSION to $BASE_URL"
