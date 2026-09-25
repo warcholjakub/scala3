@@ -82,6 +82,10 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
 
       - name: Sign the package and build its index
+        env:
+          # rpmsign warns "Could not set GPG_TTY" when there is no terminal.
+          # Setting it to anything skips that probe; signing is unaffected.
+          GPG_TTY: /dev/null
         run: |
           mkdir -p new
 
@@ -104,16 +108,27 @@ jobs:
           # Ask over HTTP whether anything is published yet. This distinguishes
           # "first publish" from "the transfer failed" - conflating the two would
           # silently drop every previously published version from the index.
-          if curl -fsS -o /dev/null "$BASE_URL/rpm/repodata/repomd.xml"; then
-            mkdir -p old
-            rsync -rt -e "$RSH" "$REMOTE:$REMOTE_DIR/rpm/repodata/" old/repodata/
-            mergerepo_c --all --repo=old --repo=new -o merged
-            echo "INDEX=merged/repodata" >> "$GITHUB_ENV"
-            echo "Merged with the published index"
-          else
-            echo "INDEX=new/repodata" >> "$GITHUB_ENV"
-            echo "Nothing published yet, this is the first publish"
-          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/rpm/repodata/repomd.xml" || echo 000)
+          case "$code" in
+            200)
+              mkdir -p old
+              rsync -rt -e "$RSH" "$REMOTE:$REMOTE_DIR/rpm/repodata/" old/repodata/
+              mergerepo_c --all --repo=old --repo=new -o merged
+              echo "INDEX=merged/repodata" >> "$GITHUB_ENV"
+              echo "Merged with the published index"
+              ;;
+            404)
+              echo "INDEX=new/repodata" >> "$GITHUB_ENV"
+              echo "Nothing published yet, this is the first publish"
+              ;;
+            *)
+              # Anything else (a proxy error, DNS failure, 000 for no reply) is not
+              # evidence that the repository is empty, and carrying on would publish
+              # an index listing only this version.
+              echo "Cannot tell whether anything is published: HTTP $code" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Upload
         # Order matters, so the repository is never inconsistent for someone
