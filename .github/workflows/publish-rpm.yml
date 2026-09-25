@@ -101,16 +101,18 @@ jobs:
         # reads the old index as data, so previously published versions stay
         # listed without their .rpm files ever touching this runner.
         run: |
-          mkdir -p old
-          rsync -rt -e "$RSH" "$REMOTE:$REMOTE_DIR/rpm/repodata/" old/repodata/ || true
-
-          if [ -n "$(ls -A old/repodata 2>/dev/null)" ]; then
+          # Ask over HTTP whether anything is published yet. This distinguishes
+          # "first publish" from "the transfer failed" - conflating the two would
+          # silently drop every previously published version from the index.
+          if curl -fsS -o /dev/null "$BASE_URL/rpm/repodata/repomd.xml"; then
+            mkdir -p old
+            rsync -rt -e "$RSH" "$REMOTE:$REMOTE_DIR/rpm/repodata/" old/repodata/
             mergerepo_c --all --repo=old --repo=new -o merged
             echo "INDEX=merged/repodata" >> "$GITHUB_ENV"
             echo "Merged with the published index"
           else
             echo "INDEX=new/repodata" >> "$GITHUB_ENV"
-            echo "No published index yet, this is the first publish"
+            echo "Nothing published yet, this is the first publish"
           fi
 
       - name: Upload
